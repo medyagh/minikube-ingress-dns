@@ -1,0 +1,59 @@
+name: Build & Publish Docker Image
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags:
+      - "v*.*.*"
+  pull_request:
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: kicbase/minikube-ingress-dns
+  CONTEXT_DIR: app/dns-server
+  DOCKERFILE_PATH: app/dns-server/docker/nodejs/Dockerfile
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/heads/main') || startsWith(github.ref, 'refs/heads/master') }}
+            type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=sha,format=short,prefix=sha-,enable=${{ !startsWith(github.ref, 'refs/tags/v') }}
+
+      - name: Build & Push Multi-Arch Image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.CONTEXT_DIR }}
+          file: ${{ env.DOCKERFILE_PATH }}
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
