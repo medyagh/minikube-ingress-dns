@@ -8,8 +8,12 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  packages: write
+
 env:
-  IMAGE_NAME: kicbase/minikube-ingress-dns
+  IMAGE_NAME_DH: kicbase/minikube-ingress-dns
   CONTEXT_DIR: app/dns-server
   DOCKERFILE_PATH: app/dns-server/docker/nodejs/Dockerfile
 
@@ -20,6 +24,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Normalize GHCR owner to lowercase
+        id: ghcr_owner
+        run: |
+          echo "GHCR_OWNER=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_ENV"
+          echo "IMAGE_NAME_GHCR=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/minikube-ingress-dns" >> "$GITHUB_ENV"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -34,17 +44,28 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Docker metadata
+      - name: Login to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata (DH + GHCR)
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE_NAME }}
+          images: |
+            ${{ env.IMAGE_NAME_DH }}
+            ${{ env.IMAGE_NAME_GHCR }}
           tags: |
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/heads/main') || startsWith(github.ref, 'refs/heads/master') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/heads/main') || startsWith(github.ref, 'refs/heads/master') || startsWith(github.ref, 'refs/tags/v') }}
             type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=sha,format=short,prefix=sha-,enable=${{ !startsWith(github.ref, 'refs/tags/v') }}
+            type=sha,format=short,prefix=sha-,enable=${{ github.event_name != 'pull_request' }}
 
-      - name: Build & Push Multi-Arch Image
+      - name: Build & Push Multi-Arch Image (DH + GHCR)
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: ${{ env.CONTEXT_DIR }}
@@ -57,3 +78,39 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: false
 
+      - name: Expose manifest digest & pinned refs
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIGEST="${{ steps.build.outputs.digest }}"
+          SHORT_SHA="${GITHUB_SHA::7}"
+
+          # Export for any later steps (optional)
+          echo "DIGEST=${DIGEST}" >> "$GITHUB_ENV"
+
+          # Always show raw digest pulls (both registries)
+          {
+            echo "Digest: ${DIGEST}"
+            echo "docker.io image:  ${IMAGE_NAME_DH}@${DIGEST}"
+            echo "ghcr.io image:    ${IMAGE_NAME_GHCR}@${DIGEST}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # If this is a semver tag push: print X.Y.Z@digest
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF#refs/tags/v}"
+            {
+              echo "Pinned (Docker Hub): ${IMAGE_NAME_DH}:${VER}@${DIGEST}"
+              echo "Pinned (GHCR):       ${IMAGE_NAME_GHCR}:${VER}@${DIGEST}"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # If this is main/master: print latest@digest and sha-<short>@digest
+          if [[ "${GITHUB_REF}" == refs/heads/main || "${GITHUB_REF}" == refs/heads/master ]]; then
+            {
+              echo "Pinned (Docker Hub): ${IMAGE_NAME_DH}:latest@${DIGEST}"
+              echo "Pinned (GHCR):       ${IMAGE_NAME_GHCR}:latest@${DIGEST}"
+              echo "Pinned (Docker Hub): ${IMAGE_NAME_DH}:sha-${SHORT_SHA}@${DIGEST}"
+              echo "Pinned (GHCR):       ${IMAGE_NAME_GHCR}:sha-${SHORT_SHA}@${DIGEST}"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
